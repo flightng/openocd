@@ -91,6 +91,7 @@ static const struct flash_driver * const flash_drivers[] = {
 	&str9xpec_flash,
 	&swm050_flash,
 	&tms470_flash,
+	&unicmicro_efc_flash,
 	&virtual_flash,
 	&w600_flash,
 	&xcf_flash,
