@@ -251,23 +251,59 @@ jobs:
           name: openocd-um324xf-windows-x86_64
           path: artifact/
           retention-days: 30
+
   # -------------------------------------------------------------------
-  # Smoke summary - runs after both platform builds
+  # Publish artifacts to a rolling 'latest-um324xf' GitHub release.
+  # Runs only on push to feat/um324xf-efc (not on PRs / dispatch dry-runs).
   # -------------------------------------------------------------------
-  summary:
-    name: Build summary
+  release:
+    name: Publish to latest-um324xf release
     needs: [linux-x86_64, windows-x86_64]
     runs-on: ubuntu-22.04
-    if: always()
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/um324xf-efc'
+    permissions:
+      contents: write
     steps:
-      - name: Status
+      - name: Checkout (for git rev info)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openocd-um324xf-linux-x86_64
+          path: dl/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openocd-um324xf-windows-x86_64
+          path: dl/windows
+
+      - name: Package archives
         run: |
-          echo "Linux build:   ${{ needs.linux-x86_64.result }}"
-          echo "Windows build: ${{ needs.windows-x86_64.result }}"
-          if [ "${{ needs.linux-x86_64.result }}" = "success" ] \
-          && [ "${{ needs.windows-x86_64.result }}" = "success" ]; then
-            echo "All builds green - artifacts available under workflow Run page"
-            exit 0
-          fi
-          echo "One or more builds failed - check matrix logs"
-          exit 1
+          mkdir -p out
+          SHA=$(git rev-parse --short HEAD)
+          tar -czf out/openocd-um324xf-linux-x86_64-${SHA}.tar.gz -C dl/linux .
+          ( cd dl/windows && zip -qr ../../out/openocd-um324xf-windows-x86_64-${SHA}.zip . )
+          ls -lh out/
+          echo "SHA=${SHA}" >> $GITHUB_ENV
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-um324xf
+          name: latest-um324xf (${{ env.SHA }})
+          body: |
+            Rolling build of OpenOCD with the Unicmicro UM324xF EFC flash driver.
+
+            Built from commit ${{ github.sha }} on push to `feat/um324xf-efc`.
+            Use these artifacts to flash UM324xF / UM3241F targets via SWD.
+
+            **Drop-in usage**: extract the archive, point your project at the `bin/openocd.exe` (Windows) or `bin/openocd` (Linux). Scripts are in `scripts/`.
+          files: |
+            out/openocd-um324xf-linux-x86_64-*.tar.gz
+            out/openocd-um324xf-windows-x86_64-*.zip
+          prerelease: true
+          make_latest: true
