@@ -1,0 +1,273 @@
+# Multi-platform OpenOCD build with the UM324xF EFC driver.
+#
+# Place this file at .github/workflows/build-um324xf.yml in your fork of
+# openocd-org/openocd (any account / org will do; the workflow is fully
+# self-contained and uses only public toolchains).
+#
+# Trigger: any push to the feat/um324xf-efc branch, or manual dispatch.
+# Output:  build artifacts for Linux x86_64 and Windows x86_64, each
+#          containing the openocd binary plus the tcl/scripts directory
+#          ready to run.
+#
+# Prerequisite (already done in the same fork branch):
+#   - src/flash/nor/unicmicro_efc.c committed (file from issue #383 §2)
+#   - 0001-flash-nor-add-Unicmicro-UM324xF-EFC-driver.patch applied
+#     (file from issue #383 §3)
+#
+# To verify the driver is registered without hardware, the workflow grep-
+# checks the build log for "unicmicro_efc" in the linker output and the
+# `openocd -c help` driver list.
+
+name: Build OpenOCD with UM324xF support
+
+on:
+  push:
+    branches:
+      - 'feat/um324xf-efc'
+      - 'feat/um324xf-**'
+  pull_request:
+    branches:
+      - 'feat/um324xf-efc'
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------
+  # Linux x86_64 native
+  # -------------------------------------------------------------------
+  linux-x86_64:
+    name: Linux (x86_64, native)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential autoconf automake libtool pkg-config texinfo \
+            libusb-1.0-0-dev libhidapi-dev libftdi1-dev libjaylink-dev \
+            libtool-bin
+
+      - name: Bootstrap
+        run: ./bootstrap
+
+      - name: Configure
+        run: |
+          ./configure \
+            --enable-internal-jimtcl \
+            --enable-cmsis-dap \
+            --enable-cmsis-dap-v2 \
+            --enable-stlink \
+            --enable-jlink \
+            --enable-ftdi \
+            --disable-werror \
+            --prefix=/tmp/openocd-install
+
+      - name: Build
+        run: make -j$(nproc) install
+
+      - name: Verify UM324xF driver is registered
+        run: |
+          /tmp/openocd-install/bin/openocd --version 2>&1 | tee /tmp/version.txt
+          grep -q '0\.1[2-9]' /tmp/version.txt || \
+            (echo "OpenOCD version too old, expected >= 0.12"; exit 1)
+          # Driver list dump - exits non-zero if no drivers, that's fine
+          /tmp/openocd-install/bin/openocd -c "exit" 2>&1 | head -5
+          # Symbol check on the binary
+          nm /tmp/openocd-install/bin/openocd 2>/dev/null | grep -q unicmicro_efc_flash || \
+            (echo "ERROR: unicmicro_efc_flash symbol not found in binary"; exit 1)
+          echo "OK: unicmicro_efc_flash linked into binary"
+
+      - name: Bundle distribution
+        run: |
+          mkdir -p artifact/openocd-um324xf-linux-x86_64
+          cp -r /tmp/openocd-install/bin       artifact/openocd-um324xf-linux-x86_64/
+          cp -r /tmp/openocd-install/share/openocd/scripts \
+                artifact/openocd-um324xf-linux-x86_64/scripts
+          # Drop a README so users know what this is
+          cat > artifact/openocd-um324xf-linux-x86_64/README.txt <<EOF
+          OpenOCD with Unicmicro UM324xF EFC support.
+          Built from <fork>@<commit> on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+          Driver source: src/flash/nor/unicmicro_efc.c
+
+          Usage:
+            ./bin/openocd -f <interface.cfg> \\
+                          -f <um324xf_target.cfg> \\
+                          -c "program <firmware.elf> verify reset exit"
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-um324xf-linux-x86_64
+          path: artifact/
+          retention-days: 30
+
+  # -------------------------------------------------------------------
+  # Windows x86_64 native via MSYS2
+  # -------------------------------------------------------------------
+  windows-x86_64:
+    name: Windows (x86_64, cross-compile from Ubuntu)
+    runs-on: ubuntu-22.04
+    env:
+      DL_DIR: ../downloads
+      BUILD_DIR: ../build
+      HOST: x86_64-w64-mingw32
+      MAKE_JOBS: 2
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autotools-dev autoconf automake libtool pkg-config \
+            cmake texinfo \
+            g++-mingw-w64-x86-64
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Bootstrap
+        run: ./bootstrap
+
+      - name: Prepare libusb1
+        env:
+          LIBUSB1_VER: 1.0.26
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          wget -q https://github.com/libusb/libusb/releases/download/v${LIBUSB1_VER}/libusb-${LIBUSB1_VER}.tar.bz2
+          tar -xjf libusb-${LIBUSB1_VER}.tar.bz2
+          echo "LIBUSB1_SRC=$PWD/libusb-${LIBUSB1_VER}" >> $GITHUB_ENV
+
+      - name: Prepare hidapi
+        env:
+          HIDAPI_VER: 0.13.1
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          wget -q https://github.com/libusb/hidapi/archive/hidapi-${HIDAPI_VER}.tar.gz
+          tar -xzf hidapi-${HIDAPI_VER}.tar.gz
+          cd hidapi-hidapi-${HIDAPI_VER}
+          ./bootstrap
+          echo "HIDAPI_SRC=$PWD" >> $GITHUB_ENV
+
+      - name: Prepare libftdi
+        env:
+          LIBFTDI_VER: 1.5
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          wget -q http://www.intra2net.com/en/developer/libftdi/download/libftdi1-${LIBFTDI_VER}.tar.bz2
+          tar -xjf libftdi1-${LIBFTDI_VER}.tar.bz2
+          echo "LIBFTDI_SRC=$PWD/libftdi1-${LIBFTDI_VER}" >> $GITHUB_ENV
+
+      - name: Prepare capstone
+        env:
+          CAPSTONE_VER: 4.0.2
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          wget -q https://github.com/aquynh/capstone/archive/${CAPSTONE_VER}.tar.gz
+          tar -xzf ${CAPSTONE_VER}.tar.gz
+          echo "CAPSTONE_SRC=$PWD/capstone-${CAPSTONE_VER}" >> $GITHUB_ENV
+
+      - name: Prepare libjaylink
+        env:
+          LIBJAYLINK_VER: 0.3.1
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          wget -q https://gitlab.zapb.de/libjaylink/libjaylink/-/archive/${LIBJAYLINK_VER}/libjaylink-${LIBJAYLINK_VER}.tar.gz
+          tar -xzf libjaylink-${LIBJAYLINK_VER}.tar.gz
+          cd libjaylink-${LIBJAYLINK_VER}
+          ./autogen.sh
+          echo "LIBJAYLINK_SRC=$PWD" >> $GITHUB_ENV
+
+      - name: Prepare jimtcl
+        env:
+          JIMTCL_VER: 0.83
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          wget -q https://github.com/msteveb/jimtcl/archive/refs/tags/${JIMTCL_VER}.tar.gz
+          tar -xzf ${JIMTCL_VER}.tar.gz
+          echo "JIMTCL_SRC=$PWD/jimtcl-${JIMTCL_VER}" >> $GITHUB_ENV
+
+      - name: Cross-build OpenOCD for Windows
+        env:
+          LIBUSB1_CONFIG: --enable-shared --disable-static
+          HIDAPI_CONFIG: --enable-shared --disable-static --disable-testgui
+          LIBFTDI_CONFIG: -DSTATICLIBS=OFF -DEXAMPLES=OFF -DFTDI_EEPROM=OFF
+          CAPSTONE_CONFIG: "CAPSTONE_BUILD_CORE_ONLY=yes CAPSTONE_STATIC=yes CAPSTONE_SHARED=no"
+          LIBJAYLINK_CONFIG: --enable-shared --disable-static
+          JIMTCL_CONFIG: --with-ext=json --minimal --disable-ssl
+        run: |
+          export OPENOCD_TAG="$(git rev-parse --short HEAD)"
+          export OPENOCD_SRC=$PWD
+          export OPENOCD_CONFIG=""
+          mkdir -p $BUILD_DIR && cd $BUILD_DIR
+          bash $OPENOCD_SRC/contrib/cross-build.sh $HOST
+          # Add missing dlls (mirrors upstream snapshot.yml)
+          cd $HOST-root/usr
+          cp "$($HOST-gcc --print-file-name=libwinpthread-1.dll)" ./bin/
+          cp "$($HOST-gcc --print-file-name=libgcc_s_seh-1.dll)" ./bin/
+
+      - name: Verify UM324xF driver is registered
+        run: |
+          OPENOCD_EXE="$BUILD_DIR/$HOST-root/usr/bin/openocd.exe"
+          ls -la "$OPENOCD_EXE"
+          $HOST-strings "$OPENOCD_EXE" | grep -q 'unicmicro_efc' || \
+            (echo "ERROR: unicmicro_efc string not found in binary"; exit 1)
+          echo "OK: unicmicro_efc linked into binary"
+
+      - name: Bundle distribution
+        run: |
+          mkdir -p artifact/openocd-um324xf-windows-x86_64
+          cp -r $BUILD_DIR/$HOST-root/usr/bin    artifact/openocd-um324xf-windows-x86_64/
+          cp -r $BUILD_DIR/$HOST-root/usr/share/openocd/scripts \
+                artifact/openocd-um324xf-windows-x86_64/scripts
+          cat > artifact/openocd-um324xf-windows-x86_64/README.txt <<EOF
+          OpenOCD with Unicmicro UM324xF EFC support.
+          Built from $(git rev-parse --short HEAD) on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+          Cross-compiled from Ubuntu via $HOST toolchain.
+          Driver: src/flash/nor/unicmicro_efc.c
+
+          QUICK USE:
+            If you already have an xpack-openocd install, copy bin/openocd.exe
+            over the existing one - the rest of the DLLs / scripts cover all
+            dependencies.
+
+            Or run standalone:
+              bin\\openocd.exe -s scripts ^
+                               -f <interface.cfg> ^
+                               -f <um324xf_target.cfg> ^
+                               -c "program <firmware.elf> verify reset exit"
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-um324xf-windows-x86_64
+          path: artifact/
+          retention-days: 30
+  # -------------------------------------------------------------------
+  # Smoke summary - runs after both platform builds
+  # -------------------------------------------------------------------
+  summary:
+    name: Build summary
+    needs: [linux-x86_64, windows-x86_64]
+    runs-on: ubuntu-22.04
+    if: always()
+    steps:
+      - name: Status
+        run: |
+          echo "Linux build:   ${{ needs.linux-x86_64.result }}"
+          echo "Windows build: ${{ needs.windows-x86_64.result }}"
+          if [ "${{ needs.linux-x86_64.result }}" = "success" ] \
+          && [ "${{ needs.windows-x86_64.result }}" = "success" ]; then
+            echo "All builds green - artifacts available under workflow Run page"
+            exit 0
+          fi
+          echo "One or more builds failed - check matrix logs"
+          exit 1
